@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>InterferenceIsolator</Name>
+    <Assembly>InterferenceIsolator.dll</Assembly>
+    <AddInId>8F4E2A19-7B3C-4D5E-9A1B-6C8D0E2F4A7B</AddInId>
+    <FullClassName>InterferenceIsolator.App</FullClassName>
+    <VendorId>GTV</VendorId>
+    <VendorDescription>Aislador y gestor de reportes de interferencias</VendorDescription>
+  </AddIn>
+</RevitAddIns>

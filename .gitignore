@@ -1,0 +1,16 @@
+﻿# Carpetas de compilación de .NET / Visual Studio
+[Bb]in/
+[Oo]bj/
+
+# Carpeta de distribución e instaladores (.exe)
+0.0 Dist_Checker/
+Output/
+*.exe
+
+# Archivos de usuario / editor / temporales
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+*.log
