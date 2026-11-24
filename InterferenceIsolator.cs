@@ -124,6 +124,7 @@ namespace InterferenceIsolator
         public int Index { get; set; }
         public string TextA { get; set; } = "";
         public string TextB { get; set; } = "";
+        public string ClashName { get; set; } = "";   // only filled when the report provides one (Navisworks)
         public long IdA { get; set; }
         public long IdB { get; set; }
         public RowStatus Status { get; set; }
@@ -148,6 +149,123 @@ namespace InterferenceIsolator
         public List<ClashRow> Rows { get; set; } = new List<ClashRow>();
     }
 
+    // ------------------------------------------------------------------ HTML PARSER
+    // Supports: Revit "Interference Report", Navisworks table report (ES/EN), Navisworks "Clash Report" (div/span, ES/EN).
+    public static class HtmlReportParser
+    {
+        enum Format { Unknown, Revit, NavisworksTable, NavisworksList }
+
+        static readonly Regex RevitRowRx = new Regex(@"<tr>\s*<td>\s*(\d+)\s*</td>\s*<td>(.*?)</td>\s*<td>(.*?)</td>",
+            RegexOptions.Singleline | RegexOptions.IgnoreCase);
+
+        public static List<ClashRow> Parse(string html)
+        {
+            List<ClashRow> rows;
+            switch (Detect(html))
+            {
+                case Format.NavisworksTable: rows = ParseNavisworksTable(html); break;
+                case Format.NavisworksList: rows = ParseNavisworksList(html); break;
+                case Format.Revit: rows = ParseRevit(html); break;
+                default: throw new InvalidDataException("Unrecognized report format (not a Revit or Navisworks HTML report).");
+            }
+            if (rows.Count == 0) throw new InvalidDataException("No interference rows were found in the HTML.");
+            return rows;
+        }
+
+        static Format Detect(string html)
+        {
+            if (html.Contains("class=\"mainTable\"")) return Format.NavisworksTable;
+            if (html.Contains("class=\"clashobject\"")) return Format.NavisworksList;
+            if (RevitRowRx.IsMatch(html)) return Format.Revit;
+            return Format.Unknown;
+        }
+
+        // strips tags first, then decodes entities (so "&lt;No level&gt;" survives), then collapses whitespace
+        static string Clean(string s) =>
+            Regex.Replace(WebUtility.HtmlDecode(Regex.Replace(s ?? "", "<.*?>", " ", RegexOptions.Singleline)), @"\s+", " ").Trim();
+
+        static string Describe(string name, long id) => string.IsNullOrEmpty(name) ? $"id {id}" : $"{name} : id {id}";
+
+        // unique Element A / Element B pairs only
+        static void AddUnique(List<ClashRow> rows, HashSet<string> seen, long idA, long idB, string nameA, string nameB, string clashName)
+        {
+            if (!seen.Add(idA + "|" + idB)) return;
+            rows.Add(new ClashRow
+            {
+                Index = rows.Count + 1, IdA = idA, IdB = idB,
+                TextA = Describe(nameA, idA), TextB = Describe(nameB, idB), ClashName = clashName ?? ""
+            });
+        }
+
+        // ---- Revit: <tr><td>n</td><td>... : id 123</td><td>... : id 456</td></tr>
+        static List<ClashRow> ParseRevit(string html)
+        {
+            var rows = new List<ClashRow>(); var seen = new HashSet<string>();
+            var idRx = new Regex(@":\s*id\s*(\d+)\s*$", RegexOptions.IgnoreCase);
+            foreach (Match m in RevitRowRx.Matches(html))
+            {
+                string a = Clean(m.Groups[2].Value), b = Clean(m.Groups[3].Value);
+                var ia = idRx.Match(a); var ib = idRx.Match(b);
+                if (!ia.Success || !ib.Success) continue;
+                long idA = long.Parse(ia.Groups[1].Value), idB = long.Parse(ib.Groups[1].Value);
+                if (!seen.Add(idA + "|" + idB)) continue;
+                rows.Add(new ClashRow { Index = int.Parse(m.Groups[1].Value), TextA = a, TextB = b, IdA = idA, IdB = idB });
+            }
+            return rows;
+        }
+
+        // ---- Navisworks table report ("Informe de conflictos"): rows with "Element ID: n" cells, clash name in 2nd cell
+        static List<ClashRow> ParseNavisworksTable(string html)
+        {
+            var rows = new List<ClashRow>(); var seen = new HashSet<string>();
+            var rowRx = new Regex(@"<tr class=""(?:clashGroupRow|childRow|childRowLast|contentRow)"">(.*?)</tr>", RegexOptions.Singleline);
+            var cellRx = new Regex(@"<td[^>]*>(.*?)</td>", RegexOptions.Singleline);
+            var idRx = new Regex(@"^(?:Element\s*ID|ID\s+de\s+elemento)\s*:\s*(\d+)$", RegexOptions.IgnoreCase);
+            foreach (Match r in rowRx.Matches(html))
+            {
+                var cells = cellRx.Matches(r.Groups[1].Value).Cast<Match>().Select(c => Clean(c.Groups[1].Value)).ToList();
+                var ids = cells.Select(c => idRx.Match(c)).Where(x => x.Success)
+                    .Select(x => long.Parse(x.Groups[1].Value)).Take(2).ToList();
+                if (ids.Count < 2) continue;                       // also skips the summary-table "contentRow" rows
+                string clashName = cells.Count > 1 ? cells[1] : "";
+                AddUnique(rows, seen, ids[0], ids[1], null, null, clashName);   // this layout has no Item Name
+            }
+            return rows;
+        }
+
+        // ---- Navisworks "Clash Report": <span class="name">Label</span><span class="value">Value</span>
+        class Item { public long Id; public string Name = ""; }
+
+        static List<ClashRow> ParseNavisworksList(string html)
+        {
+            var rows = new List<ClashRow>(); var seen = new HashSet<string>();
+            var tokRx = new Regex(@"<h4 class=""clashobject"">|<span class=""name"">(.*?)</span><span class=""value"">(.*?)</span>", RegexOptions.Singleline);
+            var clashLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Name", "Clash Name", "Nombre", "Nombre de conflicto" };
+            var idLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Element ID", "ID de elemento" };
+            var itemLabels = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "Item Name", "Nombre de elemento" };
+
+            string clashName = ""; var items = new List<Item>(); Item cur = null;
+            void Flush()
+            {
+                if (items.Count >= 2 && items[0].Id != 0 && items[1].Id != 0)
+                    AddUnique(rows, seen, items[0].Id, items[1].Id, items[0].Name, items[1].Name, clashName);
+                items = new List<Item>(); cur = null;
+            }
+
+            foreach (Match t in tokRx.Matches(html))
+            {
+                if (!t.Groups[1].Success) { cur = new Item(); items.Add(cur); continue; }   // <h4 class="clashobject">
+                string label = Clean(t.Groups[1].Value).TrimEnd('*').Trim();
+                string value = Clean(t.Groups[2].Value);
+                if (clashLabels.Contains(label)) { Flush(); clashName = value; }
+                else if (cur != null && idLabels.Contains(label)) { if (cur.Id == 0 && long.TryParse(value, out long id)) cur.Id = id; }
+                else if (cur != null && itemLabels.Contains(label)) cur.Name = value;
+            }
+            Flush();
+            return rows;
+        }
+    }
+
     public class Session
     {
         public static readonly string StoreDir = Path.Combine(
@@ -164,22 +282,7 @@ namespace InterferenceIsolator
             string hash = Convert.ToHexString(SHA256.HashData(bytes)).Substring(0, 20); // same html => same history
             string html = Encoding.UTF8.GetString(bytes);
 
-            var parsed = new List<ClashRow>();
-            var rowRx = new Regex(@"<tr>\s*<td>\s*(\d+)\s*</td>\s*<td>(.*?)</td>\s*<td>(.*?)</td>",
-                RegexOptions.Singleline | RegexOptions.IgnoreCase);
-            foreach (Match m in rowRx.Matches(html))
-            {
-                string a = WebUtility.HtmlDecode(m.Groups[2].Value).Trim();
-                string b = WebUtility.HtmlDecode(m.Groups[3].Value).Trim();
-                var ia = Regex.Match(a, @"(\d+)\s*$"); var ib = Regex.Match(b, @"(\d+)\s*$");
-                if (!ia.Success || !ib.Success) continue;
-                parsed.Add(new ClashRow
-                {
-                    Index = int.Parse(m.Groups[1].Value), TextA = a, TextB = b,
-                    IdA = long.Parse(ia.Groups[1].Value), IdB = long.Parse(ib.Groups[1].Value)
-                });
-            }
-            if (parsed.Count == 0) throw new InvalidDataException("No interference rows were found in the HTML.");
+            var parsed = HtmlReportParser.Parse(html);
 
             var s = new Session { SourcePath = htmlPath, StorePath = Path.Combine(StoreDir, hash + ".json"), Rows = parsed };
             var pm = Regex.Match(html, @"Project File:\s*</b>\s*(.*?)\s*<br>", RegexOptions.Singleline | RegexOptions.IgnoreCase);
@@ -255,7 +358,7 @@ namespace InterferenceIsolator
             var doc = uidoc.Document;
             var els = new[] { doc.GetElement(new ElementId(row.IdA)), doc.GetElement(new ElementId(row.IdB)) }
                 .Where(e => e != null).ToList();
-            if (els.Count == 0) return "Both elements were deleted.";
+            if (els.Count == 0) return "Neither element was found in the active document (deleted or located in a linked model).";
             var bbs = els.Select(e => e.get_BoundingBox(null)).Where(b => b != null).ToList();
             if (bbs.Count == 0) return "Elements have no geometry.";
 
@@ -297,7 +400,7 @@ namespace InterferenceIsolator
             var uiv = uidoc.GetOpenUIViews().FirstOrDefault(x => x.ViewId == v.Id);
             uiv?.ZoomAndCenterRectangle(bmin, bmax);
 
-            string del = (row.DeletedA || row.DeletedB) ? " (one of the elements was deleted)" : "";
+            string del = (row.DeletedA || row.DeletedB) ? " (one element was not found in the active document)" : "";
             return $"Row {row.Index} isolated{del}.";
         }
 
@@ -587,6 +690,7 @@ namespace InterferenceIsolator
             grid.Columns.Add(TextCol("#", "Index", new DataGridLength(38), false));
             grid.Columns.Add(TextCol("Element A", "DisplayA", new DataGridLength(1, DataGridLengthUnitType.Star), true));
             grid.Columns.Add(TextCol("Element B", "DisplayB", new DataGridLength(1, DataGridLengthUnitType.Star), true));
+            grid.Columns.Add(TextCol("Clash", "ClashName", new DataGridLength(110), true));
             grid.Columns.Add(TextCol("Modified", "LastChangeText", new DataGridLength(115), false));
 
             var ms = new WStyle(typeof(TextBlock));
